@@ -181,6 +181,63 @@ https://www.example.com/de/pricing
 
 Both are exactly the kind of extension I set up in custom builds — see below.
 
+## Workflow
+
+The diagram below shows how the crawler moves from input to output.
+
+```mermaid
+flowchart TD
+    A[Start] --> B{URL source}
+    B -->|start URL| C[Seed frontier]
+    B -->|--urls-file| C
+    B -->|--from-sitemap| D[Fetch robots.txt + sitemaps]
+    D --> D2[Recurse sitemap-index<br/>+ decompress .gz]
+    D2 --> C
+
+    C --> E[load robots.txt for chosen User-Agent<br/>read Crawl-delay]
+    E --> F{--list-only?}
+
+    F -->|yes| G[Fetch exactly the supplied URLs]
+    F -->|no| H[Fetch wave, follow links up to --depth]
+
+    G --> I[Per-page extraction]
+    H --> I
+
+    I --> I1[Status, redirects, headers]
+    I --> I2[Title, meta, canonical, hreflang]
+    I --> I3[Headings, word count, images, links]
+    I --> I4[JSON-LD types, OG/Twitter tags]
+    I --> I5[Flag issues + indexability verdict]
+
+    I5 --> J{More pages<br/>and under --max-pages?}
+    J -->|yes| H
+    J -->|no| K[Write seo_audit.csv + seo_audit.json]
+    K --> L[Console summary: status codes, issues]
+    L --> M[Done]
+
+    %% Politeness applies to every fetch
+    P[Per-domain rate limit + jitter<br/>retry/backoff on 429/5xx]:::note
+    P -.-> G
+    P -.-> H
+    P -.-> D
+
+    classDef note fill:#fff3cd,stroke:#e0a800,color:#664d03;
+```
+
+**Phase 1 — URL seeding.** The frontier is built from three non-exclusive sources: a positional start URL, a `--urls-file` (one URL per line), and `--from-sitemap` (auto-discovered from `robots.txt` or a URL you supply). Sitemap mode recursively resolves sitemap-index files and decompresses `.gz` archives before adding URLs to the queue. All sources are merged and deduplicated.
+
+**Phase 2 — robots.txt + rate-limit setup.** Before the first fetch, the crawler loads `robots.txt` for the chosen User-Agent and reads the `Crawl-delay` directive. This is the point where User-Agent choice matters: each UA profile sends a distinct `User-Agent` header and is evaluated against the matching `robots.txt` rules.
+
+**Phase 3 — crawl loop.** Two modes:
+- `--list-only`: fetches exactly the seeded URLs with no link discovery.
+- Default: follows internal links breadth-first up to `--depth`, stopping when `--max-pages` is reached (or the frontier is empty).
+
+Politeness runs alongside every fetch: per-domain minimum delay (jittered ±30%), automatic retry with exponential backoff on `429`/`5xx`, and `Retry-After` header support.
+
+**Phase 4 — per-page extraction.** Each fetched page is parsed for: HTTP status, redirect chain, and response headers; title, meta description, canonical, and hreflang; headings, word count, images (including missing-alt count), and link counts; JSON-LD structured-data types; Open Graph and Twitter Card tags. A final indexability verdict is computed from the combination of `meta robots`, `X-Robots-Tag`, HTTP status, and canonical.
+
+**Phase 5 — output.** After the loop exits, the crawler writes `<prefix>.csv` (flat, one row per page) and `<prefix>.json` (full nested report), then prints a console summary of status-code distribution and the most common per-page issues.
+
 ## Files
 
 ```
