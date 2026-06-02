@@ -1,0 +1,8 @@
+# Sample URL list for --urls-file.
+# One URL per line. Blank lines and lines starting with # are ignored.
+# Replace these with your own URLs.
+https://www.example.com/
+https://www.example.com/pricing
+https://www.example.com/about
+https://www.example.com/blog
+https://www.example.com/de/pricing

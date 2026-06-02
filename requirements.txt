@@ -1,0 +1,10 @@
+# Core dependencies
+requests>=2.28
+beautifulsoup4>=4.11
+lxml>=4.9
+
+# Optional: enable Brotli-compressed responses.
+# The crawler advertises only the compression it can decode, so this is safe
+# to omit — install it if a site you audit serves Brotli and you want to
+# accept it rather than fall back to gzip/deflate.
+# brotli>=1.0
