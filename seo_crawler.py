@@ -114,33 +114,57 @@ class PageReport:
     # Head / meta
     title: str = ""
     title_length: int = 0
+    title_pixel_width: int = 0
     meta_description: str = ""
     meta_description_length: int = 0
+    meta_description_pixel_width: int = 0
     meta_robots: str = ""
     x_robots_tag: str = ""
     canonical: str = ""
     canonical_is_self: bool = False
+    canonical_count: int = 0
+    canonical_source: str = ""          # "link", "header", or "link+header"
+    canonical_target_status: int = 0    # filled by --check-links pass
     lang: str = ""
     viewport: str = ""
     charset: str = ""
+    base_href: str = ""
+    favicon: str = ""
+    pagination_next: str = ""
+    pagination_prev: str = ""
 
     # Headings & content
     h1: list = field(default_factory=list)
     h1_count: int = 0
     h2_count: int = 0
+    h3_count: int = 0
+    h4_count: int = 0
+    h5_count: int = 0
+    h6_count: int = 0
+    heading_order_issues: list = field(default_factory=list)
     word_count: int = 0
+    text_html_ratio: float = 0.0
 
     # Links
     internal_links: int = 0
     external_links: int = 0
     nofollow_links: int = 0
+    sponsored_links: int = 0
+    ugc_links: int = 0
+    empty_anchor_links: int = 0
+    generic_anchor_links: int = 0
+    broken_links: list = field(default_factory=list)      # [{url, status}]
+    redirecting_links: list = field(default_factory=list)  # [{url, status}]
 
     # Images
     images_total: int = 0
     images_missing_alt: int = 0
+    images_missing_dimensions: int = 0
+    images_lazy_loaded: int = 0
 
     # International
     hreflang: list = field(default_factory=list)
+    hreflang_has_xdefault: bool = False
 
     # Social
     og_tags: dict = field(default_factory=dict)
@@ -148,6 +172,8 @@ class PageReport:
 
     # Structured data
     schema_types: list = field(default_factory=list)
+    microdata_types: list = field(default_factory=list)
+    rdfa_used: bool = False
 
     # Security / performance headers
     is_https: bool = False
@@ -155,9 +181,68 @@ class PageReport:
     content_encoding: str = ""
     cache_control: str = ""
     content_length: int = 0
+    mixed_content: int = 0
 
     # Issues found on this page
     issues: list = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Page-element analysis helpers
+# --------------------------------------------------------------------------- #
+
+# Google truncates SERP titles/descriptions on *pixel* width, not character
+# count. We approximate the rendered width with a small per-character width
+# table (units ≈ pixels at Google's ~Arial title size). Practical limits:
+# titles truncate near ~580px, descriptions near ~1000px.
+_NARROW = set("iIl.,:;'|!ftj()[]{}/\\ ")
+_WIDE = set("mwMW@%")
+TITLE_PIXEL_LIMIT = 580
+DESC_PIXEL_LIMIT = 1000
+
+# Low-value / non-descriptive anchor text that hurts link context.
+GENERIC_ANCHORS = {
+    "click here", "here", "read more", "more", "link", "this", "this page",
+    "learn more", "details", "continue", "go", "download", "visit",
+}
+
+# Minimal required-property expectations for common schema.org types. Used to
+# flag structured data that is present but incomplete for rich results.
+SCHEMA_REQUIRED = {
+    "Article": ["headline", "image"],
+    "NewsArticle": ["headline", "image"],
+    "BlogPosting": ["headline", "image"],
+    "Product": ["name", "image"],
+    "Recipe": ["name", "image"],
+    "Event": ["name", "startDate"],
+    "Organization": ["name"],
+    "LocalBusiness": ["name", "address"],
+    "BreadcrumbList": ["itemListElement"],
+    "FAQPage": ["mainEntity"],
+    "VideoObject": ["name", "thumbnailUrl", "uploadDate"],
+    "JobPosting": ["title", "datePosted", "hiringOrganization"],
+}
+
+
+def estimate_pixel_width(text, font_size=20):
+    """Approximate the rendered pixel width of SERP text.
+
+    Uses a coarse narrow/normal/wide character model scaled by font size
+    (titles ≈ 20px, descriptions ≈ 14px in Google's results).
+    """
+    if not text:
+        return 0
+    units = 0.0
+    for ch in text:
+        if ch in _NARROW:
+            units += 0.30
+        elif ch in _WIDE:
+            units += 0.85
+        elif ch.isupper():
+            units += 0.70
+        else:
+            units += 0.50
+    return int(units * font_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -172,7 +257,8 @@ class SEOCrawler:
 
     def __init__(self, start_url, user_agent, max_pages=50, max_depth=3,
                  delay=0.3, timeout=15, respect_robots=True, same_domain=True,
-                 workers=1, seed_urls=None, list_only=False, retries=3):
+                 workers=1, seed_urls=None, list_only=False, retries=3,
+                 check_links=False):
         self.start_url = start_url.rstrip("/")
         self.user_agent = user_agent
         self.max_pages = max_pages if max_pages and max_pages > 0 else float("inf")
@@ -184,6 +270,8 @@ class SEOCrawler:
         self.workers = max(1, workers)
         self.seed_urls = seed_urls or []
         self.list_only = list_only
+        self.check_links = check_links
+        self.link_status = {}  # url -> final status code (populated by check_links)
 
         self.base_domain = urlparse(self.start_url).netloc
         self.session = self._build_session(retries)
@@ -493,23 +581,38 @@ class SEOCrawler:
         if soup.title and soup.title.string:
             report.title = soup.title.string.strip()
             report.title_length = len(report.title)
+            report.title_pixel_width = estimate_pixel_width(report.title, 20)
         if not report.title:
             report.issues.append("Missing <title>")
         elif report.title_length > 60:
             report.issues.append(f"Title too long ({report.title_length} chars)")
         elif report.title_length < 10:
             report.issues.append(f"Title very short ({report.title_length} chars)")
+        # Pixel width is the real SERP truncation limit, independent of length.
+        if report.title_pixel_width > TITLE_PIXEL_LIMIT:
+            report.issues.append(
+                f"Title likely truncated in SERP "
+                f"(~{report.title_pixel_width}px > {TITLE_PIXEL_LIMIT}px)"
+            )
 
         # --- meta description ---
         md = soup.find("meta", attrs={"name": "description"})
         if md and md.get("content"):
             report.meta_description = md["content"].strip()
             report.meta_description_length = len(report.meta_description)
+            report.meta_description_pixel_width = estimate_pixel_width(
+                report.meta_description, 14
+            )
         if not report.meta_description:
             report.issues.append("Missing meta description")
         elif report.meta_description_length > 160:
             report.issues.append(
                 f"Meta description too long ({report.meta_description_length} chars)"
+            )
+        if report.meta_description_pixel_width > DESC_PIXEL_LIMIT:
+            report.issues.append(
+                f"Meta description likely truncated in SERP "
+                f"(~{report.meta_description_pixel_width}px > {DESC_PIXEL_LIMIT}px)"
             )
 
         # --- meta robots ---
@@ -524,10 +627,24 @@ class SEOCrawler:
             report.indexability_reason = "noindex directive"
             report.issues.append("Page is noindex")
 
-        # --- canonical ---
-        canon = soup.find("link", attrs={"rel": re.compile("canonical", re.I)})
-        if canon and canon.get("href"):
-            report.canonical = urljoin(report.final_url, canon["href"])
+        # --- canonical (from <link> tags AND the HTTP Link header) ---
+        link_canons = [
+            urljoin(report.final_url, c["href"])
+            for c in soup.find_all("link", attrs={"rel": re.compile("canonical", re.I)})
+            if c.get("href")
+        ]
+        header_canon = self._header_canonical(resp, report.final_url)
+        sources = []
+        if link_canons:
+            sources.append("link")
+        if header_canon:
+            sources.append("header")
+        report.canonical_source = "+".join(sources)
+        report.canonical_count = len(link_canons) + (1 if header_canon else 0)
+
+        # Prefer the <link> canonical (what most crawlers honor); fall back to header.
+        report.canonical = link_canons[0] if link_canons else (header_canon or "")
+        if report.canonical:
             report.canonical_is_self = (
                 self._normalize(report.canonical)
                 == self._normalize(report.final_url)
@@ -538,6 +655,15 @@ class SEOCrawler:
                 )
         else:
             report.issues.append("Missing canonical tag")
+
+        # Multiple/conflicting canonicals confuse search engines — flag them.
+        distinct = {self._normalize(u) for u in link_canons}
+        if header_canon:
+            distinct.add(self._normalize(header_canon))
+        if len(distinct) > 1:
+            report.issues.append(
+                f"Conflicting canonical tags ({report.canonical_count} found)"
+            )
 
         # conflicting directives
         if not report.indexable and report.canonical and report.canonical_is_self:
@@ -553,6 +679,10 @@ class SEOCrawler:
         vp = soup.find("meta", attrs={"name": "viewport"})
         if vp and vp.get("content"):
             report.viewport = vp["content"]
+            vp_l = report.viewport.lower()
+            # A viewport that blocks zoom is a mobile-usability/accessibility flag.
+            if "user-scalable=no" in vp_l or re.search(r"maximum-scale=\s*1\b", vp_l):
+                report.issues.append("Viewport disables zoom (user-scalable=no)")
         else:
             report.issues.append("Missing viewport meta (mobile)")
 
@@ -560,30 +690,79 @@ class SEOCrawler:
         if cs:
             report.charset = cs.get("charset", "")
 
-        # --- headings ---
+        # --- base href / favicon / pagination ---
+        base = soup.find("base", href=True)
+        if base:
+            report.base_href = base["href"]
+        icon = soup.find("link", attrs={"rel": re.compile("icon", re.I)}, href=True)
+        if icon:
+            report.favicon = urljoin(report.final_url, icon["href"])
+        nxt = soup.find("link", attrs={"rel": re.compile(r"\bnext\b", re.I)}, href=True)
+        if nxt:
+            report.pagination_next = urljoin(report.final_url, nxt["href"])
+        prev = soup.find("link", attrs={"rel": re.compile(r"\bprev\b", re.I)}, href=True)
+        if prev:
+            report.pagination_prev = urljoin(report.final_url, prev["href"])
+
+        # --- headings (full hierarchy + document order) ---
         h1s = [h.get_text(strip=True) for h in soup.find_all("h1")]
         report.h1 = h1s
         report.h1_count = len(h1s)
         report.h2_count = len(soup.find_all("h2"))
+        report.h3_count = len(soup.find_all("h3"))
+        report.h4_count = len(soup.find_all("h4"))
+        report.h5_count = len(soup.find_all("h5"))
+        report.h6_count = len(soup.find_all("h6"))
         if report.h1_count == 0:
             report.issues.append("No H1 found")
         elif report.h1_count > 1:
             report.issues.append(f"Multiple H1s ({report.h1_count})")
 
-        # --- structured data (JSON-LD) ---
+        # Walk headings in document order and flag skipped levels (e.g. H2 -> H4)
+        # and a first heading that isn't H1 — both break semantic structure.
+        levels = [int(h.name[1]) for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])]
+        if levels and levels[0] != 1:
+            report.heading_order_issues.append(
+                f"First heading is H{levels[0]}, not H1"
+            )
+        for prev_l, cur_l in zip(levels, levels[1:]):
+            if cur_l - prev_l > 1:
+                report.heading_order_issues.append(f"Skipped from H{prev_l} to H{cur_l}")
+        if report.heading_order_issues:
+            report.issues.append(
+                f"Broken heading order ({report.heading_order_issues[0]})"
+            )
+
+        # --- structured data (JSON-LD + Microdata + RDFa) ---
         # Extract BEFORE the word-count step below decomposes <script> tags.
+        ld_objects = []
         for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string or "{}")
                 report.schema_types.extend(self._extract_schema_types(data))
+                ld_objects.append(data)
             except (json.JSONDecodeError, TypeError):
                 report.issues.append("Invalid JSON-LD structured data")
+        # Validate required properties for known rich-result types.
+        for missing in self._validate_schema(ld_objects):
+            report.issues.append(missing)
 
-        # --- word count (visible text) ---
+        # Microdata (itemscope/itemtype) and RDFa (typeof/vocab) — older formats
+        # Google still reads; capture so JSON-LD isn't the only thing we see.
+        for node in soup.find_all(attrs={"itemtype": True}):
+            for t in node["itemtype"].split():
+                report.microdata_types.append(t.rstrip("/").rsplit("/", 1)[-1])
+        report.microdata_types = sorted(set(report.microdata_types))
+        report.rdfa_used = bool(soup.find(attrs={"typeof": True})
+                                or soup.find(attrs={"vocab": True}))
+
+        # --- word count + text-to-HTML ratio (visible text) ---
+        html_len = len(resp.text) or 1
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
         text = soup.get_text(separator=" ", strip=True)
         report.word_count = len(text.split())
+        report.text_html_ratio = round(len(text) / html_len, 3)
         if report.word_count < 200:
             report.issues.append(f"Thin content ({report.word_count} words)")
 
@@ -594,6 +773,21 @@ class SEOCrawler:
                     "lang": link["hreflang"],
                     "href": urljoin(report.final_url, link.get("href", "")),
                 })
+        if report.hreflang:
+            langs = [h["lang"].lower() for h in report.hreflang]
+            report.hreflang_has_xdefault = "x-default" in langs
+            if not report.hreflang_has_xdefault:
+                report.issues.append("hreflang set has no x-default")
+            # Each annotated page should reference itself in the set.
+            this_url = self._normalize(report.final_url)
+            if not any(self._normalize(h["href"]) == this_url for h in report.hreflang):
+                report.issues.append("hreflang set omits a self-referencing entry")
+            # Flag obviously malformed language codes (e.g. "en_US", "english").
+            bad = [h["lang"] for h in report.hreflang
+                   if h["lang"].lower() != "x-default"
+                   and not re.fullmatch(r"[a-z]{2,3}(-[a-zA-Z]{2,4})?", h["lang"])]
+            if bad:
+                report.issues.append(f"Invalid hreflang code(s): {', '.join(bad[:3])}")
 
         # --- Open Graph / Twitter ---
         for meta in soup.find_all("meta"):
@@ -603,6 +797,17 @@ class SEOCrawler:
                 report.og_tags[prop] = meta["content"]
             if name.startswith("twitter:") and meta.get("content"):
                 report.twitter_tags[name] = meta["content"]
+        # Validate the core tags that drive social/SERP previews — but only when
+        # the page already opts into Open Graph, to avoid noise on sites that don't.
+        if report.og_tags:
+            missing_og = [t for t in ("og:title", "og:image", "og:url", "og:type")
+                          if t not in report.og_tags]
+            if missing_og:
+                report.issues.append(
+                    f"Incomplete Open Graph (missing: {', '.join(missing_og)})"
+                )
+        if report.twitter_tags and "twitter:card" not in report.twitter_tags:
+            report.issues.append("Twitter Card present but missing twitter:card type")
 
         # --- images ---
         imgs = soup.find_all("img")
@@ -610,26 +815,81 @@ class SEOCrawler:
         report.images_missing_alt = sum(
             1 for img in imgs if not img.get("alt", "").strip()
         )
+        # Explicit width/height prevents layout shift (CLS); lazy-loading
+        # offscreen images improves LCP. Track both.
+        report.images_missing_dimensions = sum(
+            1 for img in imgs if not (img.get("width") and img.get("height"))
+        )
+        report.images_lazy_loaded = sum(
+            1 for img in imgs if img.get("loading", "").lower() == "lazy"
+        )
         if report.images_missing_alt:
             report.issues.append(
                 f"{report.images_missing_alt} image(s) missing alt text"
             )
+        if report.images_missing_dimensions:
+            report.issues.append(
+                f"{report.images_missing_dimensions} image(s) missing width/height (CLS)"
+            )
 
         # --- links + collect for crawl frontier ---
         new_links = []
+        link_targets = []  # (url, is_internal) for the optional broken-link pass
         for a in soup.find_all("a", href=True):
-            href = urljoin(report.final_url, a["href"])
-            href = self._normalize(href)
+            raw = a["href"].strip()
+            if raw.startswith(("mailto:", "tel:", "javascript:", "#")):
+                continue
+            href = self._normalize(urljoin(report.final_url, raw))
             rel = " ".join(a.get("rel", [])).lower()
             if "nofollow" in rel:
                 report.nofollow_links += 1
+            if "sponsored" in rel:
+                report.sponsored_links += 1
+            if "ugc" in rel:
+                report.ugc_links += 1
+
+            # Anchor-text quality (skip image links, which legitimately have none).
+            anchor = a.get_text(strip=True)
+            if not anchor and not a.find("img"):
+                report.empty_anchor_links += 1
+            elif anchor.lower() in GENERIC_ANCHORS:
+                report.generic_anchor_links += 1
+
             if self._same_site(href):
                 report.internal_links += 1
                 if href.startswith("http"):
                     new_links.append(href)
+                    link_targets.append((href, True))
             elif href.startswith("http"):
                 report.external_links += 1
+                link_targets.append((href, False))
 
+        if report.empty_anchor_links:
+            report.issues.append(
+                f"{report.empty_anchor_links} link(s) with empty anchor text"
+            )
+        if report.generic_anchor_links:
+            report.issues.append(
+                f"{report.generic_anchor_links} link(s) with generic anchor text"
+            )
+
+        # --- mixed content: insecure subresources on an HTTPS page ---
+        if report.is_https:
+            for tag, attr in (("img", "src"), ("script", "src"), ("link", "href"),
+                              ("iframe", "src"), ("source", "src"), ("video", "src"),
+                              ("audio", "src")):
+                for el in soup.find_all(tag):
+                    val = el.get(attr, "")
+                    if val.startswith("http://"):
+                        report.mixed_content += 1
+            if report.mixed_content:
+                report.issues.append(
+                    f"{report.mixed_content} insecure (HTTP) resource(s) on HTTPS page"
+                )
+
+        # Stash for the optional --check-links pass (not a dataclass field, so it
+        # won't be serialized into the JSON/CSV output).
+        report.link_targets = link_targets
         return new_links
 
     @staticmethod
@@ -645,6 +905,53 @@ class SEOCrawler:
             for item in data:
                 types.extend(SEOCrawler._extract_schema_types(item))
         return types
+
+    @staticmethod
+    def _header_canonical(resp, base_url):
+        """Extract a rel=canonical URL from the HTTP `Link` response header."""
+        link_header = resp.headers.get("Link", "")
+        if "canonical" not in link_header.lower():
+            return ""
+        # Link: <https://example.com/x>; rel="canonical"
+        for part in link_header.split(","):
+            m = re.search(r"<([^>]+)>\s*;\s*rel\s*=\s*\"?canonical\"?",
+                          part, re.IGNORECASE)
+            if m:
+                return urljoin(base_url, m.group(1).strip())
+        return ""
+
+    @staticmethod
+    def _validate_schema(ld_objects):
+        """Yield an issue string for each known schema type missing a required
+        property. Walks nested @graph / arrays so embedded entities are checked."""
+        issues = []
+        seen = set()
+
+        def walk(node):
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+            t = node.get("@type")
+            for ttype in (t if isinstance(t, list) else [t]):
+                req = SCHEMA_REQUIRED.get(ttype)
+                if req:
+                    missing = [p for p in req if not node.get(p)]
+                    if missing:
+                        key = (ttype, tuple(missing))
+                        if key not in seen:
+                            seen.add(key)
+                            issues.append(
+                                f"{ttype} schema missing required: {', '.join(missing)}"
+                            )
+            for v in node.values():
+                walk(v)
+
+        for obj in ld_objects:
+            walk(obj)
+        return issues
 
     # ----------------------------- crawl ----------------------------------- #
     def _eligible(self, url, depth):
@@ -747,6 +1054,112 @@ class SEOCrawler:
                     discovered.extend(new_links)
         return discovered
 
+    # ------------------------- post-crawl analysis ------------------------- #
+    def finalize(self):
+        """Run site-level passes that need the whole crawl in memory."""
+        self.detect_duplicates()
+        self.validate_hreflang_reciprocity()
+        if self.check_links:
+            self.check_outbound_links()
+
+    def detect_duplicates(self):
+        """Flag titles, meta descriptions, H1s and canonicals shared across
+        pages — a top cause of keyword cannibalization and index bloat."""
+        groups = {"Duplicate title": {}, "Duplicate meta description": {},
+                  "Duplicate H1": {}, "Duplicate canonical target": {}}
+        for r in self.reports:
+            if not r.parse_ok:
+                continue
+            if r.title:
+                groups["Duplicate title"].setdefault(r.title, []).append(r)
+            if r.meta_description:
+                groups["Duplicate meta description"].setdefault(
+                    r.meta_description, []).append(r)
+            if r.h1_count == 1 and r.h1[0]:
+                groups["Duplicate H1"].setdefault(r.h1[0], []).append(r)
+            # Non-self canonicals pointing at the same target = intended dedup,
+            # so only flag *self*-canonical pages that collide.
+            if r.canonical and r.canonical_is_self:
+                groups["Duplicate canonical target"].setdefault(
+                    self._normalize(r.canonical), []).append(r)
+        for label, buckets in groups.items():
+            for value, members in buckets.items():
+                if len(members) > 1:
+                    for r in members:
+                        r.issues.append(f"{label} (shared by {len(members)} pages)")
+
+    def validate_hreflang_reciprocity(self):
+        """For each hreflang annotation pointing at a page we also crawled,
+        verify the target links back (Google requires reciprocal hreflang)."""
+        by_url = {self._normalize(r.final_url or r.url): r for r in self.reports}
+        for r in self.reports:
+            for h in r.hreflang:
+                if h["lang"].lower() == "x-default":
+                    continue
+                target = by_url.get(self._normalize(h["href"]))
+                if target is None:
+                    continue  # not crawled — can't verify, don't false-flag
+                this_url = self._normalize(r.final_url or r.url)
+                if not any(self._normalize(b["href"]) == this_url
+                           for b in target.hreflang):
+                    r.issues.append(
+                        f"hreflang not reciprocated by {h['href']}"
+                    )
+                    break  # one flag per page is enough
+
+    def check_outbound_links(self):
+        """HEAD-check every unique link target (and self-canonical targets) so
+        broken (4xx/5xx) and redirecting (3xx) links can be attributed to the
+        pages that contain them. Opt-in via --check-links: it adds requests."""
+        targets = set()
+        for r in self.reports:
+            for url, _ in getattr(r, "link_targets", []):
+                targets.add(url)
+            if r.canonical and not r.canonical_is_self:
+                targets.add(self._normalize(r.canonical))
+        print(f"\n[links] Checking {len(targets)} unique link target(s)...")
+
+        def head(url):
+            self._polite_wait(url)
+            try:
+                resp = self.session.head(url, timeout=self.timeout,
+                                         allow_redirects=True)
+                # Some servers reject HEAD; fall back to a lightweight GET.
+                if resp.status_code >= 400:
+                    resp = self.session.get(url, timeout=self.timeout,
+                                            allow_redirects=True, stream=True)
+                return url, resp.status_code, bool(resp.history)
+            except requests.RequestException:
+                return url, -1, False
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            for url, status, redirected in pool.map(head, targets):
+                # Store the final status plus whether it took a redirect to get there.
+                self.link_status[url] = (status, redirected)
+
+        # Attribute results back to each page.
+        for r in self.reports:
+            for url, _ in getattr(r, "link_targets", []):
+                st, redirected = self.link_status.get(url, (0, False))
+                if st == -1 or st >= 400:
+                    r.broken_links.append({"url": url, "status": st})
+                elif redirected:
+                    r.redirecting_links.append({"url": url, "status": st})
+            if r.broken_links:
+                r.issues.append(f"{len(r.broken_links)} broken link(s)")
+            if r.redirecting_links:
+                r.issues.append(f"{len(r.redirecting_links)} redirecting link(s)")
+            if r.canonical and not r.canonical_is_self:
+                st, redirected = self.link_status.get(
+                    self._normalize(r.canonical), (0, False))
+                r.canonical_target_status = st
+                if st == -1 or st >= 400:
+                    r.issues.append(
+                        f"Canonical target is unreachable (HTTP {st})"
+                    )
+                elif redirected:
+                    r.issues.append("Canonical points to a redirect")
+
 
 # --------------------------------------------------------------------------- #
 # Output
@@ -761,10 +1174,18 @@ def write_outputs(reports, prefix):
     csv_path = f"{prefix}.csv"
     fields = [
         "url", "final_url", "status_code", "parse_ok", "response_time_ms", "indexable",
-        "indexability_reason", "title", "title_length", "meta_description_length",
-        "h1_count", "h2_count", "word_count", "canonical_is_self",
-        "internal_links", "external_links", "images_total", "images_missing_alt",
-        "hreflang_count", "schema_types", "is_https", "hsts", "issue_count",
+        "indexability_reason", "title", "title_length", "title_pixel_width",
+        "meta_description_length", "meta_description_pixel_width",
+        "canonical_is_self", "canonical_count", "canonical_target_status",
+        "h1_count", "h2_count", "h3_count", "h4_count", "h5_count", "h6_count",
+        "heading_order_ok", "word_count", "text_html_ratio",
+        "internal_links", "external_links", "nofollow_links", "sponsored_links",
+        "ugc_links", "empty_anchor_links", "generic_anchor_links",
+        "broken_links_count", "redirecting_links_count",
+        "images_total", "images_missing_alt", "images_missing_dimensions",
+        "images_lazy_loaded", "hreflang_count", "hreflang_has_xdefault",
+        "schema_types", "microdata_types", "rdfa_used", "mixed_content",
+        "is_https", "hsts", "issue_count",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -773,6 +1194,10 @@ def write_outputs(reports, prefix):
             row = asdict(r)
             row["hreflang_count"] = len(r.hreflang)
             row["schema_types"] = "|".join(sorted(set(r.schema_types)))
+            row["microdata_types"] = "|".join(r.microdata_types)
+            row["heading_order_ok"] = not r.heading_order_issues
+            row["broken_links_count"] = len(r.broken_links)
+            row["redirecting_links_count"] = len(r.redirecting_links)
             row["issue_count"] = len(r.issues)
             writer.writerow(row)
 
@@ -858,6 +1283,10 @@ def build_parser():
                    help="Do not respect robots.txt")
     p.add_argument("--allow-external", action="store_true",
                    help="Allow crawling beyond the start domain")
+    p.add_argument("--check-links", action="store_true",
+                   help="HEAD-check every internal/external link (and canonical "
+                        "targets) to find broken and redirecting links. Adds "
+                        "requests, so it's off by default.")
     p.add_argument("--out", default="seo_audit",
                    help="Output filename prefix (default: seo_audit)")
     return p
@@ -921,6 +1350,7 @@ def main():
         seed_urls=[],            # set below once all sources are merged
         list_only=args.list_only,
         retries=args.retries,
+        check_links=args.check_links,
     )
 
     # ---- gather URLs from the sitemap, if requested ----
@@ -965,6 +1395,9 @@ def main():
     if not reports:
         print("No pages crawled.")
         return
+
+    # Site-level passes (duplicates, hreflang reciprocity, optional link checks).
+    crawler.finalize()
 
     json_path, csv_path = write_outputs(reports, args.out)
     print_summary(reports, ua_label)

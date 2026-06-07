@@ -26,17 +26,38 @@ Per page, the crawler records:
 - **Response**: final URL, status code, redirect chain, response time, content type.
 - **Indexability**: a single verdict combining `meta robots`, the `X-Robots-Tag`
   header, the HTTP status, and the canonical, plus the reason it's non-indexable.
-- **On-page**: title (and length), meta description (and length), `H1`/`H2`
-  counts, visible word count.
-- **Canonical**: the canonical URL and whether it is self-referencing.
-- **International**: every `hreflang` annotation (lang + URL).
-- **Links**: internal, external, and `nofollow` counts.
-- **Images**: total images and how many are missing `alt` text.
-- **Social**: Open Graph and Twitter Card tags.
-- **Structured data**: JSON-LD `@type` values (parsed recursively).
+- **On-page**: title and meta description — both their character length **and
+  estimated SERP pixel width** (Google truncates on pixels, not characters) —
+  plus visible word count and **text-to-HTML ratio**.
+- **Headings**: full `H1`–`H6` counts and a **document-order check** that flags
+  skipped levels (e.g. `H2` → `H4`) and a first heading that isn't `H1`.
+- **Canonical**: the canonical URL and whether it is self-referencing, read from
+  **both the `<link>` tag and the HTTP `Link` header**, with **conflicting /
+  multiple canonical** detection. With `--check-links`, the canonical target's
+  HTTP status is validated too.
+- **International**: every `hreflang` annotation (lang + URL), plus validation —
+  **`x-default` presence, self-reference, malformed language codes, and
+  reciprocal return-links** between crawled pages.
+- **Links**: internal, external, `nofollow`, **`sponsored`, and `ugc`** counts;
+  **empty and generic anchor text** ("click here") detection. With
+  `--check-links`, every link is HEAD-checked for **broken (4xx/5xx) and
+  redirecting** targets.
+- **Images**: total, missing `alt`, **missing `width`/`height` (a CLS risk),**
+  and **lazy-loaded** counts.
+- **Social**: Open Graph and Twitter Card tags, with **completeness validation**
+  (missing `og:image`, `og:url`, `twitter:card`, etc.).
+- **Structured data**: JSON-LD `@type` values (parsed recursively) with
+  **required-property validation** for common rich-result types, plus
+  **Microdata (`itemtype`) and RDFa** detection.
+- **Page hygiene**: `<base href>`, favicon, `rel="next"/"prev"` pagination,
+  a **non-responsive-viewport** check, and **mixed-content** (insecure HTTP
+  subresources on an HTTPS page) detection.
 - **Security/perf headers**: HTTPS, HSTS, content-encoding, cache-control.
+- **Site-level**: **duplicate `title`, meta description, `H1`, and self-canonical
+  clusters** across the whole crawl (keyword-cannibalization / index-bloat
+  signals).
 - **Issues**: a per-page list of flagged problems (missing title, thin content,
-  multiple `H1`s, canonical conflicts, and more).
+  multiple `H1`s, canonical conflicts, and all of the above).
 
 ## Why the User-Agent option matters
 
@@ -114,6 +135,7 @@ deduplicated).
 | `--timeout`           | `15`         | Per-request timeout, in seconds.                                              |
 | `--ignore-robots`     | off          | Do not respect `robots.txt`.                                                  |
 | `--allow-external`    | off          | Allow crawling beyond the start domain.                                       |
+| `--check-links`       | off          | HEAD-check every link (and canonical target) for broken/redirecting URLs.     |
 | `--out`               | `seo_audit`  | Output filename prefix (`<prefix>.csv` and `<prefix>.json`).                  |
 
 ## Fast, without getting blocked
@@ -206,12 +228,13 @@ flowchart TD
     I --> I1[Status, redirects, headers]
     I --> I2[Title, meta, canonical, hreflang]
     I --> I3[Headings, word count, images, links]
-    I --> I4[JSON-LD types, OG/Twitter tags]
+    I --> I4[JSON-LD/Microdata/RDFa, OG/Twitter,<br/>canonical, hreflang, pagination]
     I --> I5[Flag issues + indexability verdict]
 
     I5 --> J{More pages<br/>and under --max-pages?}
     J -->|yes| H
-    J -->|no| K[Write seo_audit.csv + seo_audit.json]
+    J -->|no| S[Site-level pass:<br/>duplicates, hreflang reciprocity,<br/>optional broken-link check]
+    S --> K[Write seo_audit.csv + seo_audit.json]
     K --> L[Console summary: status codes, issues]
     L --> M[Done]
 
@@ -234,9 +257,11 @@ flowchart TD
 
 Politeness runs alongside every fetch: per-domain minimum delay (jittered ±30%), automatic retry with exponential backoff on `429`/`5xx`, and `Retry-After` header support.
 
-**Phase 4 — per-page extraction.** Each fetched page is parsed for: HTTP status, redirect chain, and response headers; title, meta description, canonical, and hreflang; headings, word count, images (including missing-alt count), and link counts; JSON-LD structured-data types; Open Graph and Twitter Card tags. A final indexability verdict is computed from the combination of `meta robots`, `X-Robots-Tag`, HTTP status, and canonical.
+**Phase 4 — per-page extraction.** Each fetched page is parsed for: HTTP status, redirect chain, and response headers; title and meta description (length **and** SERP pixel width); canonical (from the `<link>` tag and the `Link` header, with conflict detection) and hreflang (with `x-default`, self-reference, and code validation); the full `H1`–`H6` hierarchy and a heading-order check; word count and text-to-HTML ratio; images (missing-alt, missing-dimensions, lazy-load); link counts by `rel` type (`nofollow`/`sponsored`/`ugc`) and anchor-text quality; JSON-LD types (with required-property validation), Microdata, and RDFa; Open Graph / Twitter completeness; `<base>`, favicon, pagination, viewport responsiveness, and mixed content. A final indexability verdict is computed from the combination of `meta robots`, `X-Robots-Tag`, HTTP status, and canonical.
 
-**Phase 5 — output.** After the loop exits, the crawler writes `<prefix>.csv` (flat, one row per page) and `<prefix>.json` (full nested report), then prints a console summary of status-code distribution and the most common per-page issues.
+**Phase 5 — site-level analysis.** Once the crawl completes, `finalize()` runs passes that need the whole site in memory: duplicate `title` / meta / `H1` / self-canonical clustering, and hreflang reciprocity (return-link) validation. With `--check-links`, every unique internal and external link target (plus non-self canonicals) is HEAD-checked so broken (4xx/5xx) and redirecting links are attributed back to the pages that contain them.
+
+**Phase 6 — output.** The crawler writes `<prefix>.csv` (flat, one row per page) and `<prefix>.json` (full nested report), then prints a console summary of status-code distribution and the most common per-page issues.
 
 ## Files
 

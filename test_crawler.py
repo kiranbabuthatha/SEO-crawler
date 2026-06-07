@@ -212,6 +212,134 @@ def test_issue_detection():
 
 
 # --------------------------------------------------------------------------- #
+# 8. Expanded page-element extraction (headings, links, images, schema, etc.)
+# --------------------------------------------------------------------------- #
+def test_expanded_elements():
+    print("\n[8] Expanded page-element extraction")
+    html = (
+        '<!doctype html><html lang="en"><head>'
+        '<title>Expanded Elements Test Page</title>'
+        '<meta name="description" content="A page exercising the new extractors.">'
+        '<meta name="viewport" content="width=device-width, user-scalable=no">'
+        '<link rel="canonical" href="https://example.com/p">'
+        '<link rel="canonical" href="https://example.com/other">'  # conflicting
+        '<base href="https://example.com/">'
+        '<link rel="icon" href="/favicon.ico">'
+        '<link rel="next" href="https://example.com/p?page=2">'
+        '<link rel="alternate" hreflang="fr" href="https://example.com/fr/p">'
+        '<script type="application/ld+json">'
+        '{"@type":"Article","headline":"Hi"}</script>'  # missing required "image"
+        '</head><body>'
+        '<h2>Starts at H2</h2><h4>Skips to H4</h4>'  # bad order
+        '<div itemscope itemtype="https://schema.org/Product"></div>'
+        '<a href="https://example.com/internal">good anchor</a>'
+        '<a href="https://example.com/x" rel="sponsored">click here</a>'  # generic
+        '<a href="https://external.com/y" rel="ugc"></a>'  # empty anchor
+        '<img src="http://insecure.com/a.png" alt="x">'  # mixed content, no dims
+        '<img src="b.png" alt="y" width="10" height="10" loading="lazy">'
+        '</body></html>'
+    )
+    c = make_crawler()
+    r = sc.PageReport(url="https://example.com/p", final_url="https://example.com/p",
+                      status_code=200, is_https=True)
+    c.parse(r, FakeResp(html, headers={}))
+    j = " | ".join(r.issues)
+
+    check("heading counts populated", r.h2_count == 1 and r.h4_count == 1)
+    check("flags broken heading order", "Broken heading order" in j)
+    check("multiple canonicals flagged", "Conflicting canonical" in j)
+    check("canonical_count == 2", r.canonical_count == 2)
+    check("base href captured", r.base_href == "https://example.com/")
+    check("favicon captured", r.favicon.endswith("/favicon.ico"))
+    check("pagination next captured", r.pagination_next.endswith("page=2"))
+    check("viewport zoom-block flagged", "disables zoom" in j)
+    check("sponsored link counted", r.sponsored_links == 1)
+    check("ugc link counted", r.ugc_links == 1)
+    check("generic anchor flagged", r.generic_anchor_links == 1)
+    check("empty anchor flagged", r.empty_anchor_links == 1)
+    check("image missing dimensions counted", r.images_missing_dimensions == 1)
+    check("lazy image counted", r.images_lazy_loaded == 1)
+    check("mixed content detected", r.mixed_content == 1 and "insecure" in j)
+    check("microdata type captured", "Product" in r.microdata_types)
+    check("schema missing-required flagged", "Article schema missing required" in j)
+    check("hreflang no x-default flagged", "no x-default" in j)
+    check("title pixel width computed", r.title_pixel_width > 0)
+
+
+# --------------------------------------------------------------------------- #
+# 9. HTTP-header canonical (rel=canonical in the Link header)
+# --------------------------------------------------------------------------- #
+def test_header_canonical():
+    print("\n[9] Canonical from HTTP Link header")
+    html = '<html><head><title>No link-tag canonical here</title></head><body></body></html>'
+    c = make_crawler()
+    r = sc.PageReport(url="https://example.com/h", final_url="https://example.com/h",
+                      status_code=200)
+    headers = {"Link": '<https://example.com/h>; rel="canonical"'}
+    c.parse(r, FakeResp(html, headers=headers))
+    check("canonical read from header", r.canonical == "https://example.com/h")
+    check("canonical source is header", r.canonical_source == "header")
+    check("header canonical is self", r.canonical_is_self is True)
+
+
+# --------------------------------------------------------------------------- #
+# 10. Site-level duplicate detection
+# --------------------------------------------------------------------------- #
+def test_duplicate_detection():
+    print("\n[10] Cross-page duplicate detection")
+    c = make_crawler()
+    for path in ("a", "b"):
+        r = sc.PageReport(url=f"https://example.com/{path}",
+                          final_url=f"https://example.com/{path}", status_code=200)
+        r.title = "Same Title Everywhere"
+        r.h1 = ["Same H1"]
+        r.h1_count = 1
+        c.reports.append(r)
+    c.detect_duplicates()
+    joined = " | ".join(c.reports[0].issues)
+    check("duplicate title flagged", "Duplicate title" in joined)
+    check("duplicate H1 flagged", "Duplicate H1" in joined)
+
+
+# --------------------------------------------------------------------------- #
+# 11. Broken / redirecting link pass (mocked HEAD)
+# --------------------------------------------------------------------------- #
+def test_link_checking():
+    print("\n[11] Broken & redirecting link detection")
+    c = make_crawler(check_links=True)
+    r = sc.PageReport(url="https://example.com/s", final_url="https://example.com/s",
+                      status_code=200)
+    r.link_targets = [
+        ("https://example.com/ok", True),
+        ("https://example.com/dead", True),
+        ("https://example.com/moved", True),
+    ]
+    c.reports.append(r)
+
+    def fake_head(url, **kw):
+        if "dead" in url:
+            return FakeResp(status=404, url=url)
+        resp = FakeResp(status=200, url=url)
+        if "moved" in url:
+            resp.history = [FakeResp(status=301)]
+        return resp
+
+    # 404s trigger a GET fallback in the crawler, so expose both verbs.
+    c.session = type("S", (), {
+        "head": lambda self, url, **k: fake_head(url, **k),
+        "get": lambda self, url, **k: fake_head(url, **k),
+    })()
+    c.check_outbound_links()
+    check("broken link detected", any(b["url"].endswith("/dead")
+                                      for b in r.broken_links))
+    check("redirecting link detected", any(b["url"].endswith("/moved")
+                                           for b in r.redirecting_links))
+    check("healthy link not flagged",
+          not any(b["url"].endswith("/ok")
+                  for b in r.broken_links + r.redirecting_links))
+
+
+# --------------------------------------------------------------------------- #
 def main():
     print("Running offline test suite for seo_crawler.py")
     print("=" * 55)
@@ -222,6 +350,10 @@ def main():
     test_gzip_sitemap()
     test_user_agents()
     test_issue_detection()
+    test_expanded_elements()
+    test_header_canonical()
+    test_duplicate_detection()
+    test_link_checking()
 
     print("\n" + "=" * 55)
     print(f"  {_PASSED} passed, {_FAILED} failed")
