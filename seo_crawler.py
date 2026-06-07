@@ -261,8 +261,18 @@ class SEOCrawler:
                 self._domain_next_ok[host] = time.monotonic() + gap
 
     # ----------------------------- helpers --------------------------------- #
+    @staticmethod
+    def _root_host(netloc):
+        """Normalize a host for same-site comparison.
+
+        Strips a leading 'www.' so that 'www.example.com' and 'example.com'
+        (which routinely redirect to each other and mix freely in sitemaps)
+        are treated as the same site. Port, if any, is preserved.
+        """
+        return netloc[4:] if netloc.lower().startswith("www.") else netloc
+
     def _same_site(self, url):
-        return urlparse(url).netloc == self.base_domain
+        return self._root_host(urlparse(url).netloc) == self._root_host(self.base_domain)
 
     def _normalize(self, url):
         url, _ = urldefrag(url)  # drop #fragment
